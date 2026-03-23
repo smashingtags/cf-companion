@@ -445,7 +445,6 @@ def get_secret_by_env(envvar_name):
         # fallback check for original environment variable
         secret_value = get_docker_secret(envvar_name, autocast_name=False, getenv=True)
     if secret_value:
-        logger.debug("Setting environment variable '%s' by docker secret '%s'.", envvar_name, envvar_secret_name)
         os.environ[envvar_name] = secret_value
         return secret_value
 
