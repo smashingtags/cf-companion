@@ -1,0 +1,21 @@
+services:
+  cf-companion:
+    image: ghcr.io/smashingtags/cf-companion:latest
+    container_name: cf-companion
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - CF_TOKEN=${CF_TOKEN}              # Cloudflare API token (scoped to DNS edit)
+      - TARGET_DOMAIN=${TARGET_DOMAIN}    # CNAME target (e.g., your-server.example.com)
+      - DOMAIN1=${DOMAIN1}                # Primary domain to manage (e.g., example.com)
+      - DOMAIN1_ZONE_ID=${DOMAIN1_ZONE_ID}
+      - DOMAIN1_PROXIED=TRUE              # Enable Cloudflare proxy (orange cloud)
+      - TRAEFIK_VERSION=2
+      - LOG_TYPE=CONSOLE
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
