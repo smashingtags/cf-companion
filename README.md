@@ -1,8 +1,8 @@
 # cf-companion
 
-Auto-create Cloudflare DNS records when Docker containers with Traefik labels start. Part of the [HomelabARR](https://homelabarr.com) ecosystem.
+Auto-create Cloudflare DNS records when Docker containers with Traefik labels start. By [Imogen Labs](https://agents.imogenlabs.ai).
 
-Forked from [tiredofit/docker-traefik-cloudflare-companion](https://github.com/tiredofit/docker-traefik-cloudflare-companion). Modernized to remove proprietary base image dependency.
+Based on [tiredofit/docker-traefik-cloudflare-companion](https://github.com/tiredofit/docker-traefik-cloudflare-companion). Modernized to remove proprietary base image dependency.
 
 ## What it does
 

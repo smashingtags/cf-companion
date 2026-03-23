@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-LABEL maintainer="HomelabARR (github.com/smashingtags)"
+LABEL maintainer="Imogen Labs (github.com/smashingtags)"
 LABEL org.opencontainers.image.source="https://github.com/smashingtags/cf-companion"
 LABEL org.opencontainers.image.description="Auto-create Cloudflare DNS records for containers with Traefik labels"
 
