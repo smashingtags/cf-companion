@@ -1,4 +1,4 @@
-FROM python:3.12-alpine
+FROM python:3.14.0-alpine
 
 LABEL maintainer="Imogen Labs (github.com/smashingtags)"
 LABEL org.opencontainers.image.source="https://github.com/smashingtags/cf-companion"
