@@ -12,8 +12,12 @@ RUN apk add --no-cache gcc musl-dev libffi-dev && \
         requests && \
     apk del gcc musl-dev libffi-dev
 
-RUN mkdir -p /logs
+RUN addgroup -g 1001 -S cfcompanion && \
+    adduser -S cfcompanion -u 1001 -G cfcompanion && \
+    mkdir -p /logs && chown cfcompanion:cfcompanion /logs
 
 COPY app/cloudflare-companion.py /app/cloudflare-companion.py
+
+USER cfcompanion
 
 ENTRYPOINT ["python3", "-u", "/app/cloudflare-companion.py"]
