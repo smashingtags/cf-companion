@@ -78,6 +78,8 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    group_add:
+      - ${DOCKER_GID:-999}  # Run: echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
     environment:
       - CF_TOKEN=your-cloudflare-api-token
       - TARGET_DOMAIN=your-server.example.com
@@ -106,6 +108,7 @@ docker run -d \
   --name cf-companion \
   --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  --group-add $(stat -c '%g' /var/run/docker.sock) \
   -e CF_TOKEN=your-cloudflare-api-token \
   -e TARGET_DOMAIN=your-server.example.com \
   -e DOMAIN1=example.com \
@@ -115,6 +118,8 @@ docker run -d \
   --network proxy \
   smashingtags/cf-companion:latest
 ```
+
+> **Note:** The `--group-add` flag is required because the container runs as a non-root user. Without it, you'll get a `PermissionError(13, 'Permission denied')` when the container tries to access the Docker socket.
 
 ### Available Images
 
