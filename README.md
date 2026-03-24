@@ -219,6 +219,43 @@ CF Companion is built by [Imogen Labs](https://imogenlabs.ai) and pairs perfectl
 
 Deploy containers from the HomelabARR dashboard, CF Companion handles the DNS. Fully automatic.
 
+## Troubleshooting
+
+### `PermissionError(13, 'Permission denied')` on startup
+
+The container runs as a non-root user and needs access to the Docker socket. Add `group_add` with your host's Docker socket GID:
+
+```yaml
+services:
+  cf-companion:
+    group_add:
+      - ${DOCKER_GID:-999}
+```
+
+Then set the variable:
+
+```bash
+echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
+```
+
+*Thanks to [@cyb3rgh05t](https://github.com/cyb3rgh05t) for reporting this issue.*
+
+### Container starts but no DNS records are created
+
+1. Check `LOG_LEVEL=DEBUG` to see what labels are being detected
+2. Verify your containers have Traefik `Host()` labels
+3. Confirm `DOMAIN1` matches the domain in your Host rules
+4. Make sure your API token has **Edit** permission on DNS for the zone
+
+### Records created with wrong target
+
+Set `TARGET_DOMAIN` to your server's public hostname or IP. All CNAME records will point here.
+
+## Contributors
+
+<a href="https://github.com/smashingtags"><img src="https://avatars.githubusercontent.com/u/5765990?v=4" width="50" height="50" style="border-radius:50%" alt="smashingtags"></a>
+<a href="https://github.com/cyb3rgh05t"><img src="https://avatars.githubusercontent.com/u/5200101?v=4" width="50" height="50" style="border-radius:50%" alt="cyb3rgh05t"></a>
+
 ## Community
 
 - [Discord](https://discord.gg/Pc7mXX786x) — Get help, share your setup
