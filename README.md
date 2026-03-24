@@ -240,6 +240,25 @@ echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
 
 *Thanks to [@cyb3rgh05t](https://github.com/cyb3rgh05t) for reporting this issue.*
 
+### `Unable to authenticate request` (Error 10001)
+
+The new Cloudflare SDK requires `CF_TOKEN` (scoped API token), **not** the legacy `CF_EMAIL` + `CF_API_KEY` combo. If you're migrating from the upstream image or DockServer:
+
+```yaml
+# ❌ Old (won't work)
+- CLOUDFLARE_EMAIL=you@example.com
+- CLOUDFLARE_API_KEY=your-global-key
+
+# ✅ New
+- CF_TOKEN=your-scoped-api-token
+```
+
+Create a scoped token with **Edit zone DNS** permission — see [Getting a Cloudflare API Token](#getting-a-cloudflare-api-token) above.
+
+> **Note:** Global API key auth (`CF_EMAIL` + `CF_API_KEY`) is still supported but `CF_TOKEN` is recommended. If using global keys, make sure the env var names are `CF_EMAIL` and `CF_API_KEY` (not `CLOUDFLARE_EMAIL` / `CLOUDFLARE_API_KEY`).
+
+*Thanks to [@cyb3rgh05t](https://github.com/cyb3rgh05t) for reporting this issue.*
+
 ### Container starts but no DNS records are created
 
 1. Check `LOG_LEVEL=DEBUG` to see what labels are being detected
