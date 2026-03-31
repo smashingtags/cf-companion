@@ -1,4 +1,4 @@
-# Cloudflare Companion
+# CF Companion
 
 <p align="center">
     <strong>Automatic Cloudflare DNS for your Docker containers.</strong><br>
