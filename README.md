@@ -204,7 +204,7 @@ This is a modernized fork of [tiredofit/docker-traefik-cloudflare-companion](htt
 | Base image | Proprietary `tiredofit/alpine` (~200MB) | `python:3.12-alpine` (~50MB) |
 | Init system | Custom s6-overlay with shell wrappers | Direct Python entrypoint |
 | Registry | Docker Hub only | Docker Hub + GHCR |
-| Architectures | amd64 only | amd64 + arm64 |
+| Architectures | amd64 + arm64 | amd64 + arm64 |
 | CI/CD | Custom | GitHub Actions |
 | Maintenance | Last updated April 2025 | Actively maintained |
 
