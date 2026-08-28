@@ -15,6 +15,7 @@ import requests
 import signal
 import sys
 import threading
+import time
 from cloudflare import Cloudflare, APIError as CloudflareAPIError
 from urllib.parse import urlparse
 
@@ -34,6 +35,17 @@ TRAEFIK_POLL_SECONDS = int(os.environ.get('TRAEFIK_POLL_SECONDS', "60"))
 TRAEFIK_POLL_URL = os.environ.get('TRAEFIK_POLL_URL', None)
 TRAEFIK_VERSION = os.environ.get('TRAEFIK_VERSION', "2")
 RC_TYPE = os.environ.get('RC_TYPE', "CNAME")
+ALLOW_RECORD_TYPE_CHANGE = os.environ.get('ALLOW_RECORD_TYPE_CHANGE', "FALSE")
+
+# A CNAME whose content ends here points at a Cloudflare tunnel. Rewriting one
+# as an A record silently takes the hostname off the tunnel and points it at an
+# address the tunnel does not serve.
+TUNNEL_RECORD_SUFFIX = '.cfargotunnel.com'
+
+# Docker event types and the actions worth reacting to. A standalone daemon
+# only ever emits the container type; service exists in Swarm alone.
+DOCKER_EVENT_CONTAINER_ACTIONS = ('start',)
+DOCKER_EVENT_SERVICE_ACTIONS = ('create', 'update')
 
 
 # Handle Ctrl C
@@ -162,6 +174,62 @@ def is_matching(host, regexes):
             return True
     return False
 
+def is_tunnel_target(content):
+    return (content or '').lower().endswith(TUNNEL_RECORD_SUFFIX)
+
+
+def record_type_change_refused(name, record, new_type):
+    """True when rewriting `record` as `new_type` would change its type.
+
+    Retargeting a record within its own type is this tool's whole job.
+    Retyping one is not: it is how four working proxied CNAMEs to a Cloudflare
+    tunnel become four dead A records, and nothing about the label that
+    triggered the sync said anything about the record type. Retyping therefore
+    needs an explicit opt-in.
+    """
+    existing_type = (getattr(record, 'type', None) or '').upper()
+    if not existing_type or existing_type == (new_type or '').upper():
+        return False
+
+    if ALLOW_RECORD_TYPE_CHANGE:
+        logger.warning("Changing %s from %s to %s because ALLOW_RECORD_TYPE_CHANGE is set",
+                       name, existing_type, new_type)
+        return False
+
+    if is_tunnel_target(getattr(record, 'content', None)):
+        logger.warning("Refusing to convert %s from a %s pointing at a Cloudflare tunnel "
+                       "into a %s record. Set ALLOW_RECORD_TYPE_CHANGE=TRUE to permit it.",
+                       name, existing_type, new_type)
+    else:
+        logger.warning("Refusing to change %s from a %s record to a %s record. "
+                       "Set ALLOW_RECORD_TYPE_CHANGE=TRUE to permit it.",
+                       name, existing_type, new_type)
+    return True
+
+
+def write_record(name, domain_info, data, record=None):
+    """The one Cloudflare write gate.
+
+    Every decision about what to write is made before this call, so a dry run
+    and a live run reach here having taken the identical path and differ only
+    in whether the write is issued.
+    """
+    if DRY_RUN:
+        logger.info("DRY-RUN: %s to Cloudflare %s%s: %s",
+                    "POST" if record is None else "PUT",
+                    domain_info['zone_id'],
+                    "" if record is None else ", record {}".format(record.id),
+                    data)
+        return
+
+    if record is None:
+        cf.dns.records.create(zone_id=domain_info['zone_id'], **data)
+        logger.info("Created new record: %s to point to %s", name, domain_info['target_domain'])
+    else:
+        cf.dns.records.update(zone_id=domain_info['zone_id'], dns_record_id=record.id, **data)
+        logger.info("Updated existing record: %s to point to %s", name, domain_info['target_domain'])
+
+
 # Start Program to update the Cloudflare
 def point_domain(name, domain_infos):
     ok = True
@@ -169,44 +237,45 @@ def point_domain(name, domain_infos):
         if name == domain_info['target_domain']:
             continue
 
-        if name.find(domain_info['name']) >= 0:
-            if is_domain_excluded(name, domain_info):
+        if name.find(domain_info['name']) < 0:
+            continue
+
+        if is_domain_excluded(name, domain_info):
+            continue
+
+        records_response = cf.dns.records.list(zone_id=domain_info['zone_id'], name=name)
+        records = records_response.result
+
+        data = {
+            u'type': RC_TYPE,
+            u'name': name,
+            u'content': domain_info['target_domain'],
+            u'ttl': int(domain_info['ttl']),
+            u'proxied': bool(domain_info['proxied']),
+            u'comment': domain_info['comment']
+        }
+
+        try:
+            if len(records) == 0:
+                write_record(name, domain_info, data)
                 continue
 
-            records_response = cf.dns.records.list(zone_id=domain_info['zone_id'], name=name)
-            records = records_response.result
+            for record in records:
+                if record.content == domain_info['target_domain'] and not REFRESH_ENTRIES:
+                    logger.info("Existing record: %s already points to %s", name, domain_info['target_domain'])
+                    continue
 
-            data = {
-                u'type': RC_TYPE,
-                u'name': name,
-                u'content': domain_info['target_domain'],
-                u'ttl': int(domain_info['ttl']),
-                u'proxied': bool(domain_info['proxied']),
-                u'comment': domain_info['comment']
-            }
+                if record_type_change_refused(name, record, data[u'type']):
+                    continue
 
-            try:
-                if len(records) == 0:
-                    if DRY_RUN:
-                        logger.info("DRY-RUN: POST to Cloudflare %s:, %s", domain_info['zone_id'], data)
-                    else:
-                        _ = cf.dns.records.create(zone_id=domain_info['zone_id'], **data)
-                        logger.info("Created new record: %s to point to %s", name, domain_info['target_domain'])
-                else:
-                    for record in records:
-                        if record.content != domain_info['target_domain'] or REFRESH_ENTRIES:
-                            if DRY_RUN:
-                                logger.info("DRY-RUN: PUT to Cloudflare %s, %s:, %s", domain_info['zone_id'], record["id"], data)
-                            else:
-                                cf.dns.records.update(zone_id=domain_info['zone_id'], dns_record_id=record.id, **data)
-                                logger.info("Updated existing record: %s to point to %s", name, domain_info['target_domain'])
-                        else:
-                            logger.info("Existing record: %s already points to %s", name, domain_info['target_domain'])
-            except CloudflareAPIError as ex:
-                logger.error('** %s - %d %s' % (name, ex, ex))
-                ok = False
-                pass
+                write_record(name, domain_info, data, record=record)
+
+        except CloudflareAPIError as ex:
+            logger.error("** %s - %s", name, ex)
+            ok = False
+
     return ok
+
 
 def check_container_t1(c):
     def label_host():
@@ -448,31 +517,6 @@ def get_secret_by_env(envvar_name):
         os.environ[envvar_name] = secret_value
         return secret_value
 
-try:
-    # Check for uppercase docker secrets or env variables
-    email = get_secret_by_env('CF_EMAIL')
-    token = get_secret_by_env('CF_TOKEN')
-
-    # Check for any cf zone id based on the respective domain env var existing
-    RX_DOMS = re.compile('^DOMAIN[0-9]+$', re.IGNORECASE)
-    for env in os.environ:
-        if not RX_DOMS.match(env):
-            continue
-
-        get_secret_by_env("{}_ZONE_ID".format(env))
-
-    # Check for lowercase docker secrets
-    if not email:
-        email = get_docker_secret('CF_EMAIL', autocast_name=True, getenv=True)
-    if not token:
-        token = get_docker_secret('CF_TOKEN', autocast_name=True, getenv=True)
-
-    target_domain = os.environ['TARGET_DOMAIN']
-    domain = os.environ['DOMAIN1']
-
-except KeyError as e:
-    exit("ERROR: {} not defined".format(e))
-
 if DRY_RUN.lower() == "true":
     DRY_RUN = True
 elif DRY_RUN.lower() == "false":
@@ -498,98 +542,217 @@ if ENABLE_TRAEFIK_POLL.lower() == "true":
 elif ENABLE_TRAEFIK_POLL.lower() == "false":
     ENABLE_TRAEFIK_POLL = False
 
+if ALLOW_RECORD_TYPE_CHANGE.lower() == "true":
+    ALLOW_RECORD_TYPE_CHANGE = True
+elif ALLOW_RECORD_TYPE_CHANGE.lower() == "false":
+    ALLOW_RECORD_TYPE_CHANGE = False
+
 if not ENABLE_DOCKER_POLL and DOCKER_SWARM_MODE:
     exit("ERROR: Cannot enable DOCKER_SWARM_MODE without enabling ENABLE_DOCKER_POLL=true")
 
-if DRY_RUN:
-    logger.warning("Dry Run: %s", DRY_RUN)
-logger.debug("Docker Polling: %s", ENABLE_DOCKER_POLL)
-logger.debug("Swarm Mode: %s", DOCKER_SWARM_MODE)
-logger.debug("Refresh Entries: %s", REFRESH_ENTRIES)
-logger.debug("Traefik Version: %s", TRAEFIK_VERSION)
-logger.debug("Default TTL: %s", DEFAULT_TTL)
-
-if not email:
-    logger.debug("API Mode: Scoped")
-    cf = Cloudflare(api_token=token)
-else:
-    logger.debug("API Mode: Global")
-    cf = Cloudflare(api_email=email, api_key=token)
+cf = None
+client = None
+api = None
+email = None
+token = None
+target_domain = None
+domain = None
 
 
-if ENABLE_TRAEFIK_POLL:
-    if TRAEFIK_VERSION == "2":
-        if uri_valid(TRAEFIK_POLL_URL):
-            logger.debug("Traefik Poll Url: %s", TRAEFIK_POLL_URL)
-            logger.debug("Traefik Poll Seconds: %s", TRAEFIK_POLL_SECONDS)
+def load_credentials():
+    global email, token, target_domain, domain
+
+    try:
+        # Check for uppercase docker secrets or env variables
+        email = get_secret_by_env('CF_EMAIL')
+        token = get_secret_by_env('CF_TOKEN')
+
+        # Check for any cf zone id based on the respective domain env var existing
+        RX_DOMS = re.compile('^DOMAIN[0-9]+$', re.IGNORECASE)
+        for env in os.environ:
+            if not RX_DOMS.match(env):
+                continue
+
+            get_secret_by_env("{}_ZONE_ID".format(env))
+
+        # Check for lowercase docker secrets
+        if not email:
+            email = get_docker_secret('CF_EMAIL', autocast_name=True, getenv=True)
+        if not token:
+            token = get_docker_secret('CF_TOKEN', autocast_name=True, getenv=True)
+
+        target_domain = os.environ['TARGET_DOMAIN']
+        domain = os.environ['DOMAIN1']
+
+    except KeyError as e:
+        exit("ERROR: {} not defined".format(e))
+
+
+def build_event_filters(swarm_mode=None):
+    """Filters for GET /events.
+
+    The daemon's filter keys are lowercase and it silently IGNORES any key it
+    does not recognise -- a mis-cased key neither errors nor narrows the
+    stream. A standalone daemon never emits type=service either, so filtering
+    on it is a watch that can never fire. Service events are added alongside
+    container events under Swarm, never in place of them.
+    """
+    if swarm_mode is None:
+        swarm_mode = DOCKER_SWARM_MODE
+
+    types = ['container']
+    actions = list(DOCKER_EVENT_CONTAINER_ACTIONS)
+
+    if swarm_mode:
+        types.append('service')
+        actions.extend(DOCKER_EVENT_SERVICE_ACTIONS)
+
+    return {'type': types, 'event': actions}
+
+
+def event_type_and_action(event):
+    """Read an event's type and action across daemon versions.
+
+    Docker 29 (API 1.55) stopped sending the top-level "status", "id" and
+    "from" fields on container events, so dispatching on event['status'] drops
+    every event on a current daemon while still looking healthy.
+    """
+    event_type = event.get(u'Type')
+    action = event.get(u'Action') or event.get(u'status')
+
+    if event_type is None and event.get(u'status') is not None:
+        event_type = u'container'
+
+    return event_type, action
+
+
+def event_subject_id(event):
+    actor = event.get(u'Actor') or {}
+    return actor.get(u'ID') or event.get(u'id')
+
+
+def handle_event(event, domain_infos, docker_client=None, swarm_mode=None):
+    if swarm_mode is None:
+        swarm_mode = DOCKER_SWARM_MODE
+    if docker_client is None:
+        docker_client = client
+
+    event_type, action = event_type_and_action(event)
+    subject_id = event_subject_id(event)
+    new_mappings = {}
+
+    if event_type == u'container' and action in DOCKER_EVENT_CONTAINER_ACTIONS:
+        try:
+            container = docker_client.containers.get(subject_id)
+        except docker.errors.NotFound:
+            # Normal: the container was gone before we could inspect it. Not a
+            # reason to stop watching -- doing so silences reconciliation for
+            # good on the first race.
+            logger.debug("Container %s went away before it could be inspected", subject_id)
+            return
+
+        if TRAEFIK_VERSION == "1":
+            add_to_mappings(new_mappings, check_container_t1(container))
+        elif TRAEFIK_VERSION == "2":
+            add_to_mappings(new_mappings, check_container_t2(container))
+
+    elif swarm_mode and event_type == u'service' and action in DOCKER_EVENT_SERVICE_ACTIONS:
+        logger.debug("Detected %s on service: %s", action, subject_id)
+        try:
+            if TRAEFIK_VERSION == "1":
+                add_to_mappings(new_mappings, check_service_t1(subject_id))
+            elif TRAEFIK_VERSION == "2":
+                add_to_mappings(new_mappings, check_service_t2(subject_id))
+        except docker.errors.NotFound:
+            logger.debug("Service %s went away before it could be inspected", subject_id)
+            return
+
+    else:
+        return
+
+    if new_mappings:
+        sync_mappings(new_mappings, domain_infos)
+
+
+def watch_events(domain_infos, docker_client=None, swarm_mode=None, since=None, reconnect=True):
+    if docker_client is None:
+        docker_client = client
+
+    filters = build_event_filters(swarm_mode)
+    logger.debug("Docker event filters: %s", filters)
+
+    while True:
+        watching_since = since or datetime.now().strftime("%s")
+        logger.debug("Watching Docker events since: %s", watching_since)
+
+        for event in docker_client.events(since=watching_since, filters=filters, decode=True):
+            handle_event(event, domain_infos, docker_client, swarm_mode)
+
+        if not reconnect:
+            return
+
+        logger.debug("Docker event stream ended, resubscribing")
+        since = None
+        time.sleep(1)
+
+
+def main():
+    global cf, client, api, ENABLE_TRAEFIK_POLL
+
+    load_credentials()
+
+    if DRY_RUN:
+        logger.warning("Dry Run: %s", DRY_RUN)
+    logger.debug("Docker Polling: %s", ENABLE_DOCKER_POLL)
+    logger.debug("Swarm Mode: %s", DOCKER_SWARM_MODE)
+    logger.debug("Refresh Entries: %s", REFRESH_ENTRIES)
+    logger.debug("Traefik Version: %s", TRAEFIK_VERSION)
+    logger.debug("Default TTL: %s", DEFAULT_TTL)
+
+    if not email:
+        logger.debug("API Mode: Scoped")
+        cf = Cloudflare(api_token=token)
+    else:
+        logger.debug("API Mode: Global")
+        cf = Cloudflare(api_email=email, api_key=token)
+
+    if ENABLE_TRAEFIK_POLL:
+        if TRAEFIK_VERSION == "2":
+            if uri_valid(TRAEFIK_POLL_URL):
+                logger.debug("Traefik Poll Url: %s", TRAEFIK_POLL_URL)
+                logger.debug("Traefik Poll Seconds: %s", TRAEFIK_POLL_SECONDS)
+            else:
+                ENABLE_TRAEFIK_POLL = False
+                logger.error("Traefik Polling Mode disabled because traefik url is invalid: %s", TRAEFIK_POLL_URL)
         else:
             ENABLE_TRAEFIK_POLL = False
-            logger.error("Traefik Polling Mode disabled because traefik url is invalid: %s", TRAEFIK_POLL_URL)
-    else:
-        ENABLE_TRAEFIK_POLL = False
-        logger.error("Traefik Polling Mode disabled because traefik version is not 2")
+            logger.error("Traefik Polling Mode disabled because traefik version is not 2")
 
-logger.debug("Traefik Polling Mode: %s", False)
+    logger.debug("Traefik Polling Mode: %s", ENABLE_TRAEFIK_POLL)
 
-if ENABLE_DOCKER_POLL:
-    client = docker.from_env()
+    if ENABLE_DOCKER_POLL:
+        client = docker.from_env()
 
-    if DOCKER_SWARM_MODE:
-        DOCKER_HOST = os.environ.get('DOCKER_HOST', None)
-        api = docker.APIClient(base_url=DOCKER_HOST)
+        if DOCKER_SWARM_MODE:
+            DOCKER_HOST = os.environ.get('DOCKER_HOST', None)
+            api = docker.APIClient(base_url=DOCKER_HOST)
 
-doms = init_doms_from_env()
-traefik_included_hosts, traefik_excluded_hosts = init_traefik_from_env()
+    doms = init_doms_from_env()
+    traefik_included_hosts, traefik_excluded_hosts = init_traefik_from_env()
 
-sync_mappings(get_initial_mappings(traefik_included_hosts, traefik_excluded_hosts), doms)
+    sync_mappings(get_initial_mappings(traefik_included_hosts, traefik_excluded_hosts), doms)
 
-if ENABLE_TRAEFIK_POLL:
-    logger.debug("Starting traefik router polling")
-    traefik_poll = RepeatedTimer(TRAEFIK_POLL_SECONDS, check_traefik_and_sync_mappings, args=(traefik_included_hosts, traefik_excluded_hosts, doms))
-    traefik_poll.start()
-    atexit.register(traefik_poll.cancel)
+    if ENABLE_TRAEFIK_POLL:
+        logger.debug("Starting traefik router polling")
+        traefik_poll = RepeatedTimer(TRAEFIK_POLL_SECONDS, check_traefik_and_sync_mappings, args=(traefik_included_hosts, traefik_excluded_hosts, doms))
+        traefik_poll.start()
+        atexit.register(traefik_poll.cancel)
 
-logger.debug("Starting event watch routines")
+    logger.debug("Starting event watch routines")
 
-t = datetime.now().strftime("%s")
+    if ENABLE_DOCKER_POLL:
+        watch_events(doms)
 
-logger.debug("Time: %s", t)
 
-if ENABLE_DOCKER_POLL:
-    forever=0
-    while (forever < 777):
-        for event in client.events(since=t, filters={'Type': 'service', 'Action': u'update', 'status': u'start'}, decode=True):
-            new_mappings = {}
-            if event.get(u'status') == u'start':
-                try:
-                    if TRAEFIK_VERSION == "1":
-                        add_to_mappings(new_mappings, check_container_t1(client.containers.get(event.get(u'id'))))
-                        if DOCKER_SWARM_MODE:
-                            add_to_mappings(new_mappings, check_service_t1(client.services.get(event.get(u'id'))))
-                    elif TRAEFIK_VERSION == "2":
-                        add_to_mappings(new_mappings, check_container_t2(client.containers.get(event.get(u'id'))))
-                        if DOCKER_SWARM_MODE:
-                            add_to_mappings(new_mappings, check_service_t2(client.services.get(event.get(u'id'))))
-
-                except docker.errors.NotFound as e:
-                    forever=778
-                    pass
-
-            if DOCKER_SWARM_MODE:
-                if event.get(u'Action') == u'update':
-                    try:
-                        if TRAEFIK_VERSION == "1":
-                            node_id = event.get(u'Actor').get(u'ID')
-                            logger.debug("Detected Update on node: %s", node_id)
-                            add_to_mappings(new_mappings, check_service_t1(node_id))
-                        elif TRAEFIK_VERSION == "2":
-                            node_id = event.get(u'Actor').get(u'ID')
-                            service_id = client.services.list()
-                            logger.debug("Detected Update on node: %s", node_id)
-                            add_to_mappings(new_mappings, check_service_t2(node_id))
-
-                    except docker.errors.NotFound as e:
-                        forever=778
-                        pass
-
-            sync_mappings(new_mappings, doms)
+if __name__ == '__main__':
+    main()

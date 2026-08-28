@@ -137,6 +137,7 @@ Multi-arch: `linux/amd64` and `linux/arm64`.
 3. **Label extraction** — parses `Host()` rules from Traefik v1 or v2 labels
 4. **DNS sync** — creates or updates CNAME records in Cloudflare via API
 5. **Idempotent** — existing records are left alone, only missing ones are created
+6. **Type-safe** — an existing record is never rewritten as a different type unless you ask for it
 
 Supports:
 - Traefik v1 and v2 label formats
@@ -164,6 +165,7 @@ Supports:
 | `DRY_RUN` | `FALSE` | Log actions without making changes |
 | `REFRESH_ENTRIES` | `FALSE` | Update records even if target matches |
 | `RC_TYPE` | `CNAME` | DNS record type |
+| `ALLOW_RECORD_TYPE_CHANGE` | `FALSE` | Permit rewriting an existing record as a different type (see below) |
 | `DEFAULT_TTL` | `1` | Default TTL for all domains |
 | `DOCKER_SWARM_MODE` | `FALSE` | Enable Swarm service discovery |
 | `ENABLE_TRAEFIK_POLL` | `FALSE` | Poll Traefik API instead of Docker events |
@@ -171,6 +173,61 @@ Supports:
 | `TRAEFIK_POLL_SECONDS` | `60` | Polling interval |
 | `LOG_LEVEL` | `INFO` | DEBUG, VERBOSE, or INFO |
 | `LOG_TYPE` | `BOTH` | CONSOLE, FILE, or BOTH |
+
+## Changing a record's type
+
+`RC_TYPE` picks the type for records this tool **creates**. It does not
+retype records that already exist, because retyping is how a working setup
+breaks: a proxied `CNAME` pointing at a Cloudflare tunnel, rewritten as an
+`A` record, takes the hostname off the tunnel and points it at an address the
+tunnel does not serve. The container label that triggered the sync said
+nothing about record types, so it is not the label's call to make.
+
+If an existing record's type differs from `RC_TYPE`, the change is refused and
+logged:
+
+```
+Refusing to convert app.example.com from a CNAME pointing at a Cloudflare
+tunnel into an A record. Set ALLOW_RECORD_TYPE_CHANGE=TRUE to permit it.
+```
+
+Set `ALLOW_RECORD_TYPE_CHANGE=TRUE` when the retype is genuinely what you
+want. Retargeting a record within its own type — the normal case — is
+unaffected and needs no opt-in.
+
+## Running with a read-only Docker socket proxy
+
+The container only ever reads from Docker: it lists containers, inspects them,
+and streams events. It never issues a write. That means it can run against a
+read-only socket proxy instead of a mounted `/var/run/docker.sock`:
+
+```yaml
+services:
+  cf-socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    environment:
+      - CONTAINERS=1
+      - EVENTS=1
+      - VERSION=1
+      - PING=1
+      - POST=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket-proxy
+
+  cf-companion:
+    image: smashingtags/cf-companion:latest
+    environment:
+      - DOCKER_HOST=tcp://cf-socket-proxy:2375
+    networks:
+      - socket-proxy
+      - proxy
+```
+
+`CONTAINERS`, `EVENTS`, `VERSION` and `PING` are the whole surface required.
+Swarm mode additionally needs `SERVICES=1` and `TASKS=1`; leave them off if
+you are not using Swarm.
 
 ## Getting a Cloudflare API Token
 
@@ -239,6 +296,20 @@ echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
 ```
 
 *Thanks to [@cyb3rgh05t](https://github.com/cyb3rgh05t) for reporting this issue.*
+
+### Records sync at startup, then nothing happens
+
+Versions before this fix filtered Docker events on `Type=service`, an event
+type only emitted in Swarm mode. Docker silently ignores filter keys it does
+not recognise, so nothing errored — the stream simply never produced anything
+the loop acted on, and reconciliation was startup-only in practice while the
+container looked healthy.
+
+Docker Engine 29 (API 1.55) compounded it by dropping the legacy top-level
+`status`, `id` and `from` fields from container events. Code dispatching on
+`event['status']` sees `None` on every event.
+
+Both are fixed. If you are on an older image, pull the latest.
 
 ### `Unable to authenticate request` (Error 10001)
 
