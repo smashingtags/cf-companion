@@ -12,7 +12,30 @@ env:
   DOCKERHUB_IMAGE: smashingtags/cf-companion
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir \
+            "docker>=7.0.0" \
+            "cloudflare>=4.1.0,<5.0.0" \
+            get-docker-secret \
+            requests \
+            pytest
+
+      - name: Run tests
+        run: pytest -q
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
