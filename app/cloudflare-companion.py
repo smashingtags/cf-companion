@@ -448,31 +448,6 @@ def get_secret_by_env(envvar_name):
         os.environ[envvar_name] = secret_value
         return secret_value
 
-try:
-    # Check for uppercase docker secrets or env variables
-    email = get_secret_by_env('CF_EMAIL')
-    token = get_secret_by_env('CF_TOKEN')
-
-    # Check for any cf zone id based on the respective domain env var existing
-    RX_DOMS = re.compile('^DOMAIN[0-9]+$', re.IGNORECASE)
-    for env in os.environ:
-        if not RX_DOMS.match(env):
-            continue
-
-        get_secret_by_env("{}_ZONE_ID".format(env))
-
-    # Check for lowercase docker secrets
-    if not email:
-        email = get_docker_secret('CF_EMAIL', autocast_name=True, getenv=True)
-    if not token:
-        token = get_docker_secret('CF_TOKEN', autocast_name=True, getenv=True)
-
-    target_domain = os.environ['TARGET_DOMAIN']
-    domain = os.environ['DOMAIN1']
-
-except KeyError as e:
-    exit("ERROR: {} not defined".format(e))
-
 if DRY_RUN.lower() == "true":
     DRY_RUN = True
 elif DRY_RUN.lower() == "false":
@@ -501,95 +476,168 @@ elif ENABLE_TRAEFIK_POLL.lower() == "false":
 if not ENABLE_DOCKER_POLL and DOCKER_SWARM_MODE:
     exit("ERROR: Cannot enable DOCKER_SWARM_MODE without enabling ENABLE_DOCKER_POLL=true")
 
-if DRY_RUN:
-    logger.warning("Dry Run: %s", DRY_RUN)
-logger.debug("Docker Polling: %s", ENABLE_DOCKER_POLL)
-logger.debug("Swarm Mode: %s", DOCKER_SWARM_MODE)
-logger.debug("Refresh Entries: %s", REFRESH_ENTRIES)
-logger.debug("Traefik Version: %s", TRAEFIK_VERSION)
-logger.debug("Default TTL: %s", DEFAULT_TTL)
+cf = None
+client = None
+api = None
+email = None
+token = None
+target_domain = None
+domain = None
 
-if not email:
-    logger.debug("API Mode: Scoped")
-    cf = Cloudflare(api_token=token)
-else:
-    logger.debug("API Mode: Global")
-    cf = Cloudflare(api_email=email, api_key=token)
+def load_credentials():
+    global email, token, target_domain, domain
+
+    try:
+        # Check for uppercase docker secrets or env variables
+        email = get_secret_by_env('CF_EMAIL')
+        token = get_secret_by_env('CF_TOKEN')
+
+        # Check for any cf zone id based on the respective domain env var existing
+        RX_DOMS = re.compile('^DOMAIN[0-9]+$', re.IGNORECASE)
+        for env in os.environ:
+            if not RX_DOMS.match(env):
+                continue
+
+            get_secret_by_env("{}_ZONE_ID".format(env))
+
+        # Check for lowercase docker secrets
+        if not email:
+            email = get_docker_secret('CF_EMAIL', autocast_name=True, getenv=True)
+        if not token:
+            token = get_docker_secret('CF_TOKEN', autocast_name=True, getenv=True)
+
+        target_domain = os.environ['TARGET_DOMAIN']
+        domain = os.environ['DOMAIN1']
+
+    except KeyError as e:
+        exit("ERROR: {} not defined".format(e))
 
 
-if ENABLE_TRAEFIK_POLL:
-    if TRAEFIK_VERSION == "2":
-        if uri_valid(TRAEFIK_POLL_URL):
-            logger.debug("Traefik Poll Url: %s", TRAEFIK_POLL_URL)
-            logger.debug("Traefik Poll Seconds: %s", TRAEFIK_POLL_SECONDS)
+def build_event_filters(swarm_mode=None):
+    if swarm_mode is None:
+        swarm_mode = DOCKER_SWARM_MODE
+
+    return {'Type': 'service', 'Action': u'update', 'status': u'start'}
+
+
+def handle_event(event, domain_infos, docker_client=None, swarm_mode=None):
+    if swarm_mode is None:
+        swarm_mode = DOCKER_SWARM_MODE
+    if docker_client is None:
+        docker_client = client
+
+    stop = False
+    new_mappings = {}
+
+    if event.get(u'status') == u'start':
+        try:
+            if TRAEFIK_VERSION == "1":
+                add_to_mappings(new_mappings, check_container_t1(docker_client.containers.get(event.get(u'id'))))
+                if swarm_mode:
+                    add_to_mappings(new_mappings, check_service_t1(docker_client.services.get(event.get(u'id'))))
+            elif TRAEFIK_VERSION == "2":
+                add_to_mappings(new_mappings, check_container_t2(docker_client.containers.get(event.get(u'id'))))
+                if swarm_mode:
+                    add_to_mappings(new_mappings, check_service_t2(docker_client.services.get(event.get(u'id'))))
+
+        except docker.errors.NotFound:
+            stop = True
+
+    if swarm_mode:
+        if event.get(u'Action') == u'update':
+            try:
+                node_id = event.get(u'Actor').get(u'ID')
+                logger.debug("Detected Update on node: %s", node_id)
+                if TRAEFIK_VERSION == "1":
+                    add_to_mappings(new_mappings, check_service_t1(node_id))
+                elif TRAEFIK_VERSION == "2":
+                    add_to_mappings(new_mappings, check_service_t2(node_id))
+
+            except docker.errors.NotFound:
+                stop = True
+
+    sync_mappings(new_mappings, domain_infos)
+    return stop
+
+
+def watch_events(domain_infos, docker_client=None, swarm_mode=None, since=None, reconnect=True):
+    if docker_client is None:
+        docker_client = client
+    if since is None:
+        since = datetime.now().strftime("%s")
+
+    logger.debug("Time: %s", since)
+
+    filters = build_event_filters(swarm_mode)
+    logger.debug("Docker event filters: %s", filters)
+
+    forever = 0
+    while forever < 777:
+        for event in docker_client.events(since=since, filters=filters, decode=True):
+            if handle_event(event, domain_infos, docker_client, swarm_mode):
+                forever = 778
+
+        if not reconnect:
+            return
+
+
+def main():
+    global cf, client, api, ENABLE_TRAEFIK_POLL
+
+    load_credentials()
+
+    if DRY_RUN:
+        logger.warning("Dry Run: %s", DRY_RUN)
+    logger.debug("Docker Polling: %s", ENABLE_DOCKER_POLL)
+    logger.debug("Swarm Mode: %s", DOCKER_SWARM_MODE)
+    logger.debug("Refresh Entries: %s", REFRESH_ENTRIES)
+    logger.debug("Traefik Version: %s", TRAEFIK_VERSION)
+    logger.debug("Default TTL: %s", DEFAULT_TTL)
+
+    if not email:
+        logger.debug("API Mode: Scoped")
+        cf = Cloudflare(api_token=token)
+    else:
+        logger.debug("API Mode: Global")
+        cf = Cloudflare(api_email=email, api_key=token)
+
+    if ENABLE_TRAEFIK_POLL:
+        if TRAEFIK_VERSION == "2":
+            if uri_valid(TRAEFIK_POLL_URL):
+                logger.debug("Traefik Poll Url: %s", TRAEFIK_POLL_URL)
+                logger.debug("Traefik Poll Seconds: %s", TRAEFIK_POLL_SECONDS)
+            else:
+                ENABLE_TRAEFIK_POLL = False
+                logger.error("Traefik Polling Mode disabled because traefik url is invalid: %s", TRAEFIK_POLL_URL)
         else:
             ENABLE_TRAEFIK_POLL = False
-            logger.error("Traefik Polling Mode disabled because traefik url is invalid: %s", TRAEFIK_POLL_URL)
-    else:
-        ENABLE_TRAEFIK_POLL = False
-        logger.error("Traefik Polling Mode disabled because traefik version is not 2")
+            logger.error("Traefik Polling Mode disabled because traefik version is not 2")
 
-logger.debug("Traefik Polling Mode: %s", False)
+    logger.debug("Traefik Polling Mode: %s", ENABLE_TRAEFIK_POLL)
 
-if ENABLE_DOCKER_POLL:
-    client = docker.from_env()
+    if ENABLE_DOCKER_POLL:
+        client = docker.from_env()
 
-    if DOCKER_SWARM_MODE:
-        DOCKER_HOST = os.environ.get('DOCKER_HOST', None)
-        api = docker.APIClient(base_url=DOCKER_HOST)
+        if DOCKER_SWARM_MODE:
+            DOCKER_HOST = os.environ.get('DOCKER_HOST', None)
+            api = docker.APIClient(base_url=DOCKER_HOST)
 
-doms = init_doms_from_env()
-traefik_included_hosts, traefik_excluded_hosts = init_traefik_from_env()
+    doms = init_doms_from_env()
+    traefik_included_hosts, traefik_excluded_hosts = init_traefik_from_env()
 
-sync_mappings(get_initial_mappings(traefik_included_hosts, traefik_excluded_hosts), doms)
+    sync_mappings(get_initial_mappings(traefik_included_hosts, traefik_excluded_hosts), doms)
 
-if ENABLE_TRAEFIK_POLL:
-    logger.debug("Starting traefik router polling")
-    traefik_poll = RepeatedTimer(TRAEFIK_POLL_SECONDS, check_traefik_and_sync_mappings, args=(traefik_included_hosts, traefik_excluded_hosts, doms))
-    traefik_poll.start()
-    atexit.register(traefik_poll.cancel)
+    if ENABLE_TRAEFIK_POLL:
+        logger.debug("Starting traefik router polling")
+        traefik_poll = RepeatedTimer(TRAEFIK_POLL_SECONDS, check_traefik_and_sync_mappings, args=(traefik_included_hosts, traefik_excluded_hosts, doms))
+        traefik_poll.start()
+        atexit.register(traefik_poll.cancel)
 
-logger.debug("Starting event watch routines")
+    logger.debug("Starting event watch routines")
 
-t = datetime.now().strftime("%s")
+    if ENABLE_DOCKER_POLL:
+        watch_events(doms)
 
-logger.debug("Time: %s", t)
 
-if ENABLE_DOCKER_POLL:
-    forever=0
-    while (forever < 777):
-        for event in client.events(since=t, filters={'Type': 'service', 'Action': u'update', 'status': u'start'}, decode=True):
-            new_mappings = {}
-            if event.get(u'status') == u'start':
-                try:
-                    if TRAEFIK_VERSION == "1":
-                        add_to_mappings(new_mappings, check_container_t1(client.containers.get(event.get(u'id'))))
-                        if DOCKER_SWARM_MODE:
-                            add_to_mappings(new_mappings, check_service_t1(client.services.get(event.get(u'id'))))
-                    elif TRAEFIK_VERSION == "2":
-                        add_to_mappings(new_mappings, check_container_t2(client.containers.get(event.get(u'id'))))
-                        if DOCKER_SWARM_MODE:
-                            add_to_mappings(new_mappings, check_service_t2(client.services.get(event.get(u'id'))))
-
-                except docker.errors.NotFound as e:
-                    forever=778
-                    pass
-
-            if DOCKER_SWARM_MODE:
-                if event.get(u'Action') == u'update':
-                    try:
-                        if TRAEFIK_VERSION == "1":
-                            node_id = event.get(u'Actor').get(u'ID')
-                            logger.debug("Detected Update on node: %s", node_id)
-                            add_to_mappings(new_mappings, check_service_t1(node_id))
-                        elif TRAEFIK_VERSION == "2":
-                            node_id = event.get(u'Actor').get(u'ID')
-                            service_id = client.services.list()
-                            logger.debug("Detected Update on node: %s", node_id)
-                            add_to_mappings(new_mappings, check_service_t2(node_id))
-
-                    except docker.errors.NotFound as e:
-                        forever=778
-                        pass
-
-            sync_mappings(new_mappings, doms)
+if __name__ == '__main__':
+    main()
