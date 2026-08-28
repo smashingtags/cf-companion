@@ -558,6 +558,7 @@ token = None
 target_domain = None
 domain = None
 
+
 def load_credentials():
     global email, token, target_domain, domain
 
