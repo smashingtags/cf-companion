@@ -148,4 +148,5 @@ def test_a_failed_dns_lookup_is_logged_and_reported_not_raised(cfc, monkeypatch,
     with caplog.at_level("ERROR"):
         assert cfc.point_domain("app.example.com", [domain_info(TUNNEL)]) is False
 
-    assert "app.example.com" in caplog.text
+    # The failure is logged against the record it was for (the handler logs "** <name> - <error>").
+    assert [r.args[0] for r in caplog.records if r.levelname == "ERROR"] == ["app.example.com"]
