@@ -1,0 +1,308 @@
+"""The Docker event watcher must react on a standalone daemon.
+
+A standalone Docker daemon never emits type=service events -- that type only
+exists in Swarm. A watcher that filters on it watches forever and reacts to
+nothing, which silently degrades reconciliation to startup-only.
+"""
+
+from conftest import FakeContainer, FakeDockerClient, domain_info
+
+TRAEFIK_LABELS = {
+    "traefik.http.routers.app.rule": "Host(`app.example.com`)",
+}
+
+
+def container_start_event(cont_id="abc123"):
+    """The shape a standalone Docker daemon actually emits.
+
+    Captured from Docker Engine 29.7.2 (API 1.55). Modern daemons no longer
+    send the legacy top-level "status", "id" and "from" fields -- only Type,
+    Action and Actor are present.
+    """
+    return {
+        u"Type": u"container",
+        u"Action": u"start",
+        u"Actor": {u"ID": cont_id, u"Attributes": {u"name": u"app"}},
+        u"scope": u"local",
+        u"time": 1756339200,
+        u"timeNano": 1756339200000000000,
+    }
+
+
+def legacy_container_start_event(cont_id="abc123"):
+    """The pre-API-1.55 shape: status/id/from only, no Type, Action or Actor."""
+    return {
+        u"status": u"start",
+        u"id": cont_id,
+        u"from": u"nginx:latest",
+        u"time": 1756339200,
+    }
+
+
+def service_update_event(service_id="svc123"):
+    return {
+        u"Type": u"service",
+        u"Action": u"update",
+        u"Actor": {u"ID": service_id, u"Attributes": {u"name": u"app"}},
+        u"scope": u"swarm",
+        u"time": 1756339200,
+    }
+
+
+def test_standalone_filters_watch_container_events(cfc):
+    filters = cfc.build_event_filters(swarm_mode=False)
+
+    assert "container" in filters.get("type", []), (
+        "standalone Docker only emits container events; got %r" % (filters,)
+    )
+    assert "service" not in filters.get("type", []), (
+        "service events do not exist outside Swarm; got %r" % (filters,)
+    )
+    assert all(key == key.lower() for key in filters), (
+        "Docker's event filter keys are lowercase; got %r" % (filters,)
+    )
+
+
+def test_swarm_filters_add_services_without_dropping_containers(cfc):
+    filters = cfc.build_event_filters(swarm_mode=True)
+
+    assert "container" in filters.get("type", [])
+    assert "service" in filters.get("type", [])
+
+
+def test_watcher_reacts_to_a_standalone_container_start(cfc, monkeypatch):
+    pointed = []
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: pointed.append(name) or True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc, "DOCKER_SWARM_MODE", False)
+
+    container = FakeContainer("abc123", TRAEFIK_LABELS)
+    client = FakeDockerClient([container_start_event()], {"abc123": container})
+
+    cfc.watch_events(
+        [domain_info("tunnel.cfargotunnel.com")],
+        docker_client=client,
+        swarm_mode=False,
+        since="0",
+        reconnect=False,
+    )
+
+    assert pointed == ["app.example.com"], (
+        "watcher did not react to a container start event on standalone Docker"
+    )
+
+
+def test_watcher_survives_a_container_that_vanishes(cfc, monkeypatch):
+    """A container that dies before it can be inspected must not stop the watch.
+
+    Otherwise the first race permanently silences reconciliation, which is the
+    same symptom the filter bug produced.
+    """
+    pointed = []
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: pointed.append(name) or True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc, "DOCKER_SWARM_MODE", False)
+
+    survivor = FakeContainer("bbb", TRAEFIK_LABELS)
+    client = FakeDockerClient(
+        [container_start_event("gone"), container_start_event("bbb")],
+        {"bbb": survivor},
+    )
+
+    cfc.watch_events(
+        [domain_info("tunnel.cfargotunnel.com")],
+        docker_client=client,
+        swarm_mode=False,
+        since="0",
+        reconnect=False,
+    )
+
+    assert pointed == ["app.example.com"]
+
+
+def test_swarm_service_event_is_still_handled(cfc, monkeypatch):
+    pointed = []
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: pointed.append(name) or True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc, "check_service_t2", lambda service_id: {"svc.example.com": 1})
+
+    client = FakeDockerClient([service_update_event()])
+
+    cfc.watch_events(
+        [domain_info("tunnel.cfargotunnel.com")],
+        docker_client=client,
+        swarm_mode=True,
+        since="0",
+        reconnect=False,
+    )
+
+    assert pointed == ["svc.example.com"]
+
+
+def test_handler_still_reads_the_legacy_event_schema(cfc, monkeypatch):
+    """Older daemons send only status/id/from. Fed straight to handle_event,
+    because the fake daemon's filter speaks only the modern schema."""
+    pointed = []
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: pointed.append(name) or True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+
+    event = legacy_container_start_event()
+    assert not {u"Type", u"Action", u"Actor"} & set(event)
+
+    client = FakeDockerClient([], {"abc123": FakeContainer("abc123", TRAEFIK_LABELS)})
+    cfc.handle_event(event, [domain_info("tunnel.cfargotunnel.com")], client, False)
+
+    assert pointed == ["app.example.com"]
+
+
+def test_noisy_events_are_filtered_out_at_the_daemon(cfc, monkeypatch):
+    """The filter must actually narrow the stream, not just ride along."""
+    pointed = []
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: pointed.append(name) or True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc, "DOCKER_SWARM_MODE", False)
+
+    noise = {
+        u"Type": u"container",
+        u"Action": u"exec_create: /bin/sh -c healthcheck",
+        u"Actor": {u"ID": u"abc123"},
+    }
+    container = FakeContainer("abc123", TRAEFIK_LABELS)
+    client = FakeDockerClient([noise], {"abc123": container})
+
+    cfc.watch_events(
+        [domain_info("tunnel.cfargotunnel.com")],
+        docker_client=client,
+        swarm_mode=False,
+        since="0",
+        reconnect=False,
+    )
+
+    assert pointed == []
+
+
+class StopWatching(Exception):
+    pass
+
+
+class ReconnectingClient:
+    """First subscription yields one event then ends; the second is recorded."""
+
+    def __init__(self, containers):
+        self.containers = containers
+        self.since_values = []
+
+    def events(self, since=None, filters=None, decode=True):
+        self.since_values.append(since)
+        if len(self.since_values) == 1:
+            return iter([container_start_event("abc123")])
+        if len(self.since_values) == 2:
+            return iter([])
+        raise StopWatching()
+
+
+def test_resubscribing_resumes_from_the_last_event_seen(cfc, monkeypatch):
+    """A container started while the stream was down must still be synced.
+
+    Docker only replays what happened after `since`, so a resubscription that
+    starts "now" loses everything in the gap.
+    """
+    from conftest import FakeContainers
+
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc.time, "sleep", lambda seconds: None)
+    client = ReconnectingClient(FakeContainers({"abc123": FakeContainer("abc123", TRAEFIK_LABELS)}))
+
+    try:
+        cfc.watch_events([domain_info("tunnel.cfargotunnel.com")],
+                         docker_client=client, swarm_mode=False)
+    except StopWatching:
+        pass
+
+    assert len(client.since_values) == 3
+    assert client.since_values[1] == 1756339200, (
+        "resubscribed from %r instead of the last event time" % (client.since_values[1],)
+    )
+    assert client.since_values[2] == 1756339200, (
+        "an empty stream must not lose the cursor; got %r" % (client.since_values[2],)
+    )
+
+
+class FlakyClient:
+    """Fails one subscription its own way, then serves what is scripted."""
+
+    def __init__(self, containers, failure, fail_at):
+        self.containers = containers
+        self.failure = failure
+        self.fail_at = fail_at  # "subscribe" or "stream"
+        self.since_values = []
+
+    def events(self, since=None, filters=None, decode=True):
+        self.since_values.append(since)
+        call = len(self.since_values)
+        if call == 1:
+            if self.fail_at == "subscribe":
+                raise self.failure
+            return self._stream_then_fail()
+        if call == 2:
+            return iter([])
+        raise StopWatching()
+
+    def _stream_then_fail(self):
+        yield container_start_event("abc123")
+        raise self.failure
+
+
+def run_flaky(cfc, monkeypatch, failure, fail_at, since="1700000000"):
+    from conftest import FakeContainers
+
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc.time, "sleep", lambda seconds: None)
+    client = FlakyClient(
+        FakeContainers({"abc123": FakeContainer("abc123", TRAEFIK_LABELS)}), failure, fail_at)
+    try:
+        cfc.watch_events([domain_info("tunnel.cfargotunnel.com")], docker_client=client,
+                         swarm_mode=False, since=since)
+    except StopWatching:
+        pass
+    return client
+
+
+def test_a_refused_subscription_is_retried_from_the_same_cursor(cfc, monkeypatch):
+    import requests
+
+    client = run_flaky(cfc, monkeypatch, requests.exceptions.ConnectionError("down"), "subscribe")
+
+    assert client.since_values == ["1700000000", "1700000000", "1700000000"]
+
+
+def test_a_stream_dropped_mid_flight_resumes_from_the_last_event(cfc, monkeypatch):
+    import docker.errors
+
+    client = run_flaky(cfc, monkeypatch, docker.errors.APIError("socket closed"), "stream")
+
+    assert client.since_values[1] == 1756339200
+    assert client.since_values[2] == 1756339200
+
+
+def test_a_read_timeout_mid_stream_is_retried(cfc, monkeypatch):
+    import requests
+
+    client = run_flaky(cfc, monkeypatch, requests.exceptions.ReadTimeout("slow"), "stream")
+
+    assert client.since_values[1] == 1756339200
+
+
+def test_without_reconnect_a_stream_failure_is_not_swallowed(cfc, monkeypatch):
+    import pytest
+    import requests
+
+    client = FlakyClient({}, requests.exceptions.ConnectionError("down"), "subscribe")
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        cfc.watch_events([domain_info("t.cfargotunnel.com")], docker_client=client,
+                         swarm_mode=False, since="0", reconnect=False)
+
+    assert len(client.since_values) == 1
