@@ -299,15 +299,16 @@ echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
 
 ### Records sync at startup, then nothing happens
 
-Versions before this fix filtered Docker events on `Type=service`, an event
-type only emitted in Swarm mode. Docker silently ignores filter keys it does
-not recognise, so nothing errored — the stream simply never produced anything
-the loop acted on, and reconciliation was startup-only in practice while the
-container looked healthy.
+Versions before this fix passed Docker an event filter written with
+mixed-case keys (`Type`, `Action`, `status`). Docker does not recognise those
+keys and ignores them without an error, so the filter never applied: the
+stream was unfiltered and did carry container events. On older engines the
+loop still acted on them, because it read each event's legacy `status` field.
 
-Docker Engine 29 (API 1.55) compounded it by dropping the legacy top-level
-`status`, `id` and `from` fields from container events. Code dispatching on
-`event['status']` sees `None` on every event.
+Docker Engine 29 (API 1.55) dropped the legacy top-level `status`, `id` and
+`from` fields from container events. The events still arrived, but code
+dispatching on `event['status']` saw `None` on every one and skipped it, so
+reconciliation became startup-only while the container looked healthy.
 
 Both are fixed. If you are on an older image, pull the latest.
 
