@@ -132,3 +132,20 @@ def test_opted_in_type_change_is_applied_when_content_already_matches(cfc, monke
 
     assert len(cf.dns.records.updated) == 1
     assert cf.dns.records.updated[0][2]["type"] == "A"
+
+
+def test_a_failed_dns_lookup_is_logged_and_reported_not_raised(cfc, monkeypatch, caplog):
+    """A Cloudflare outage must not escape point_domain and kill the watcher."""
+    class ExplodingRecords:
+        def list(self, zone_id=None, name=None):
+            raise cfc.CloudflareAPIError("boom", request=None, body=None)
+
+    cf = FakeCloudflare()
+    cf.dns.records = ExplodingRecords()
+    monkeypatch.setattr(cfc, "cf", cf)
+    monkeypatch.setattr(cfc, "DRY_RUN", False)
+
+    with caplog.at_level("ERROR"):
+        assert cfc.point_domain("app.example.com", [domain_info(TUNNEL)]) is False
+
+    assert "app.example.com" in caplog.text

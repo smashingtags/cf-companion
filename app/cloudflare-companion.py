@@ -16,6 +16,7 @@ import signal
 import sys
 import threading
 import time
+import urllib3
 from cloudflare import Cloudflare, APIError as CloudflareAPIError
 from urllib.parse import urlparse
 
@@ -243,9 +244,6 @@ def point_domain(name, domain_infos):
         if is_domain_excluded(name, domain_info):
             continue
 
-        records_response = cf.dns.records.list(zone_id=domain_info['zone_id'], name=name)
-        records = records_response.result
-
         data = {
             u'type': RC_TYPE,
             u'name': name,
@@ -256,6 +254,8 @@ def point_domain(name, domain_infos):
         }
 
         try:
+            records = cf.dns.records.list(zone_id=domain_info['zone_id'], name=name).result
+
             if len(records) == 0:
                 write_record(name, domain_info, data)
                 continue
@@ -673,6 +673,14 @@ def handle_event(event, domain_infos, docker_client=None, swarm_mode=None):
         sync_mappings(new_mappings, domain_infos)
 
 
+# What a dropped or refused Docker connection raises, on subscribe or mid-stream.
+EVENT_STREAM_ERRORS = (
+    docker.errors.DockerException,
+    requests.exceptions.RequestException,
+    urllib3.exceptions.HTTPError,
+)
+
+
 def watch_events(domain_infos, docker_client=None, swarm_mode=None, since=None, reconnect=True):
     if docker_client is None:
         docker_client = client
@@ -684,15 +692,21 @@ def watch_events(domain_infos, docker_client=None, swarm_mode=None, since=None, 
         since = since or datetime.now().strftime("%s")
         logger.debug("Watching Docker events since: %s", since)
 
-        for event in docker_client.events(since=since, filters=filters, decode=True):
-            handle_event(event, domain_infos, docker_client, swarm_mode)
-            if event.get(u'time') is not None:
-                since = event[u'time']
+        try:
+            for event in docker_client.events(since=since, filters=filters, decode=True):
+                handle_event(event, domain_infos, docker_client, swarm_mode)
+                if event.get(u'time') is not None:
+                    since = event[u'time']
+        except EVENT_STREAM_ERRORS as ex:
+            if not reconnect:
+                raise
+            logger.warning("Docker event stream failed (%s: %s), retrying from %s",
+                           type(ex).__name__, ex, since)
+        else:
+            if not reconnect:
+                return
+            logger.debug("Docker event stream ended, resubscribing from %s", since)
 
-        if not reconnect:
-            return
-
-        logger.debug("Docker event stream ended, resubscribing from %s", since)
         time.sleep(1)
 
 

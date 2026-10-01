@@ -226,8 +226,8 @@ services:
 ```
 
 `CONTAINERS`, `EVENTS`, `VERSION` and `PING` are the whole surface required.
-Swarm mode additionally needs `SERVICES=1` and `TASKS=1`; leave them off if
-you are not using Swarm.
+Swarm mode additionally needs `SERVICES=1` (the companion lists and inspects
+services, never tasks); leave it off if you are not using Swarm.
 
 ## Getting a Cloudflare API Token
 

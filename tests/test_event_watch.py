@@ -229,3 +229,82 @@ def test_resubscribing_resumes_from_the_last_event_seen(cfc, monkeypatch):
     assert client.since_values[2] == 1756339200, (
         "an empty stream must not lose the cursor; got %r" % (client.since_values[2],)
     )
+
+
+class FlakyClient:
+    """Fails one subscription its own way, then serves what is scripted."""
+
+    def __init__(self, containers, failure, fail_at):
+        self.containers = containers
+        self.failure = failure
+        self.fail_at = fail_at  # "subscribe" or "stream"
+        self.since_values = []
+
+    def events(self, since=None, filters=None, decode=True):
+        self.since_values.append(since)
+        call = len(self.since_values)
+        if call == 1:
+            if self.fail_at == "subscribe":
+                raise self.failure
+            return self._stream_then_fail()
+        if call == 2:
+            return iter([])
+        raise StopWatching()
+
+    def _stream_then_fail(self):
+        yield container_start_event("abc123")
+        raise self.failure
+
+
+def run_flaky(cfc, monkeypatch, failure, fail_at, since="1700000000"):
+    from conftest import FakeContainers
+
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc.time, "sleep", lambda seconds: None)
+    client = FlakyClient(
+        FakeContainers({"abc123": FakeContainer("abc123", TRAEFIK_LABELS)}), failure, fail_at)
+    try:
+        cfc.watch_events([domain_info("tunnel.cfargotunnel.com")], docker_client=client,
+                         swarm_mode=False, since=since)
+    except StopWatching:
+        pass
+    return client
+
+
+def test_a_refused_subscription_is_retried_from_the_same_cursor(cfc, monkeypatch):
+    import requests
+
+    client = run_flaky(cfc, monkeypatch, requests.exceptions.ConnectionError("down"), "subscribe")
+
+    assert client.since_values == ["1700000000", "1700000000", "1700000000"]
+
+
+def test_a_stream_dropped_mid_flight_resumes_from_the_last_event(cfc, monkeypatch):
+    import docker.errors
+
+    client = run_flaky(cfc, monkeypatch, docker.errors.APIError("socket closed"), "stream")
+
+    assert client.since_values[1] == 1756339200
+    assert client.since_values[2] == 1756339200
+
+
+def test_a_read_timeout_mid_stream_is_retried(cfc, monkeypatch):
+    import requests
+
+    client = run_flaky(cfc, monkeypatch, requests.exceptions.ReadTimeout("slow"), "stream")
+
+    assert client.since_values[1] == 1756339200
+
+
+def test_without_reconnect_a_stream_failure_is_not_swallowed(cfc, monkeypatch):
+    import pytest
+    import requests
+
+    client = FlakyClient({}, requests.exceptions.ConnectionError("down"), "subscribe")
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        cfc.watch_events([domain_info("t.cfargotunnel.com")], docker_client=client,
+                         swarm_mode=False, since="0", reconnect=False)
+
+    assert len(client.since_values) == 1
