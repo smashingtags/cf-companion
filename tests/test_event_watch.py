@@ -30,10 +30,13 @@ def container_start_event(cont_id="abc123"):
 
 
 def legacy_container_start_event(cont_id="abc123"):
-    """The pre-API-1.55 shape, still emitted by older daemons."""
-    event = container_start_event(cont_id)
-    event.update({u"status": u"start", u"id": cont_id, u"from": u"nginx:latest"})
-    return event
+    """The pre-API-1.55 shape: status/id/from only, no Type, Action or Actor."""
+    return {
+        u"status": u"start",
+        u"id": cont_id,
+        u"from": u"nginx:latest",
+        u"time": 1756339200,
+    }
 
 
 def service_update_event(service_id="svc123"):
@@ -136,23 +139,18 @@ def test_swarm_service_event_is_still_handled(cfc, monkeypatch):
     assert pointed == ["svc.example.com"]
 
 
-def test_watcher_still_handles_the_legacy_event_schema(cfc, monkeypatch):
-    """Older daemons send status/id alongside Type/Action. Both must work."""
+def test_handler_still_reads_the_legacy_event_schema(cfc, monkeypatch):
+    """Older daemons send only status/id/from. Fed straight to handle_event,
+    because the fake daemon's filter speaks only the modern schema."""
     pointed = []
     monkeypatch.setattr(cfc, "point_domain", lambda name, doms: pointed.append(name) or True)
     monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
-    monkeypatch.setattr(cfc, "DOCKER_SWARM_MODE", False)
 
-    container = FakeContainer("abc123", TRAEFIK_LABELS)
-    client = FakeDockerClient([legacy_container_start_event()], {"abc123": container})
+    event = legacy_container_start_event()
+    assert not {u"Type", u"Action", u"Actor"} & set(event)
 
-    cfc.watch_events(
-        [domain_info("tunnel.cfargotunnel.com")],
-        docker_client=client,
-        swarm_mode=False,
-        since="0",
-        reconnect=False,
-    )
+    client = FakeDockerClient([], {"abc123": FakeContainer("abc123", TRAEFIK_LABELS)})
+    cfc.handle_event(event, [domain_info("tunnel.cfargotunnel.com")], client, False)
 
     assert pointed == ["app.example.com"]
 
