@@ -181,3 +181,51 @@ def test_noisy_events_are_filtered_out_at_the_daemon(cfc, monkeypatch):
     )
 
     assert pointed == []
+
+
+class StopWatching(Exception):
+    pass
+
+
+class ReconnectingClient:
+    """First subscription yields one event then ends; the second is recorded."""
+
+    def __init__(self, containers):
+        self.containers = containers
+        self.since_values = []
+
+    def events(self, since=None, filters=None, decode=True):
+        self.since_values.append(since)
+        if len(self.since_values) == 1:
+            return iter([container_start_event("abc123")])
+        if len(self.since_values) == 2:
+            return iter([])
+        raise StopWatching()
+
+
+def test_resubscribing_resumes_from_the_last_event_seen(cfc, monkeypatch):
+    """A container started while the stream was down must still be synced.
+
+    Docker only replays what happened after `since`, so a resubscription that
+    starts "now" loses everything in the gap.
+    """
+    from conftest import FakeContainers
+
+    monkeypatch.setattr(cfc, "point_domain", lambda name, doms: True)
+    monkeypatch.setattr(cfc, "TRAEFIK_VERSION", "2")
+    monkeypatch.setattr(cfc.time, "sleep", lambda seconds: None)
+    client = ReconnectingClient(FakeContainers({"abc123": FakeContainer("abc123", TRAEFIK_LABELS)}))
+
+    try:
+        cfc.watch_events([domain_info("tunnel.cfargotunnel.com")],
+                         docker_client=client, swarm_mode=False)
+    except StopWatching:
+        pass
+
+    assert len(client.since_values) == 3
+    assert client.since_values[1] == 1756339200, (
+        "resubscribed from %r instead of the last event time" % (client.since_values[1],)
+    )
+    assert client.since_values[2] == 1756339200, (
+        "an empty stream must not lose the cursor; got %r" % (client.since_values[2],)
+    )

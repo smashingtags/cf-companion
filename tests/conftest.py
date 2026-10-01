@@ -26,6 +26,31 @@ def cfc(monkeypatch):
     sys.modules.pop(spec.name, None)
 
 
+@pytest.fixture
+def load_cfc(monkeypatch):
+    """Import the companion with environment variables set first.
+
+    Several settings are parsed once, at import time, so a test about parsing
+    has to set the environment before the module loads.
+    """
+    loaded = []
+
+    def load(**env):
+        monkeypatch.setenv("LOG_TYPE", "CONSOLE")
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        spec = importlib.util.spec_from_file_location("cloudflare_companion", APP)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        loaded.append(spec.name)
+        return module
+
+    yield load
+    for name in loaded:
+        sys.modules.pop(name, None)
+
+
 class FakeContainer:
     def __init__(self, cont_id, labels):
         self.attrs = {u"Id": cont_id, u"Config": {u"Labels": labels}}

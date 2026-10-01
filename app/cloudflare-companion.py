@@ -261,11 +261,12 @@ def point_domain(name, domain_infos):
                 continue
 
             for record in records:
-                if record.content == domain_info['target_domain'] and not REFRESH_ENTRIES:
-                    logger.info("Existing record: %s already points to %s", name, domain_info['target_domain'])
+                if record_type_change_refused(name, record, data[u'type']):
                     continue
 
-                if record_type_change_refused(name, record, data[u'type']):
+                same_type = (getattr(record, 'type', None) or '').upper() == data[u'type'].upper()
+                if record.content == domain_info['target_domain'] and same_type and not REFRESH_ENTRIES:
+                    logger.info("Existing record: %s already points to %s", name, domain_info['target_domain'])
                     continue
 
                 write_record(name, domain_info, data, record=record)
@@ -542,10 +543,8 @@ if ENABLE_TRAEFIK_POLL.lower() == "true":
 elif ENABLE_TRAEFIK_POLL.lower() == "false":
     ENABLE_TRAEFIK_POLL = False
 
-if ALLOW_RECORD_TYPE_CHANGE.lower() == "true":
-    ALLOW_RECORD_TYPE_CHANGE = True
-elif ALLOW_RECORD_TYPE_CHANGE.lower() == "false":
-    ALLOW_RECORD_TYPE_CHANGE = False
+# Fail closed: this guard protects working records, so anything but "true" is off.
+ALLOW_RECORD_TYPE_CHANGE = ALLOW_RECORD_TYPE_CHANGE.strip().lower() == "true"
 
 if not ENABLE_DOCKER_POLL and DOCKER_SWARM_MODE:
     exit("ERROR: Cannot enable DOCKER_SWARM_MODE without enabling ENABLE_DOCKER_POLL=true")
@@ -682,17 +681,18 @@ def watch_events(domain_infos, docker_client=None, swarm_mode=None, since=None, 
     logger.debug("Docker event filters: %s", filters)
 
     while True:
-        watching_since = since or datetime.now().strftime("%s")
-        logger.debug("Watching Docker events since: %s", watching_since)
+        since = since or datetime.now().strftime("%s")
+        logger.debug("Watching Docker events since: %s", since)
 
-        for event in docker_client.events(since=watching_since, filters=filters, decode=True):
+        for event in docker_client.events(since=since, filters=filters, decode=True):
             handle_event(event, domain_infos, docker_client, swarm_mode)
+            if event.get(u'time') is not None:
+                since = event[u'time']
 
         if not reconnect:
             return
 
-        logger.debug("Docker event stream ended, resubscribing")
-        since = None
+        logger.debug("Docker event stream ended, resubscribing from %s", since)
         time.sleep(1)
 
 

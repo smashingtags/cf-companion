@@ -1,5 +1,7 @@
 """point_domain must be safe in dry-run and must not silently retype records."""
 
+import pytest
+
 from conftest import FakeCloudflare, FakeRecord, domain_info
 
 TUNNEL = "70b3146b-88c7-4a00-926c-e5b4fe5727a0.cfargotunnel.com"
@@ -85,3 +87,48 @@ def test_same_type_content_change_is_still_applied(cfc, monkeypatch):
 
     assert len(cf.dns.records.updated) == 1
     assert cf.dns.records.updated[0][2]["content"] == TUNNEL
+
+
+@pytest.mark.parametrize("spelling", ["FALSE ", "yes", "1", "", "false", "tru"])
+def test_only_true_permits_a_record_type_change(load_cfc, spelling):
+    cfc = load_cfc(ALLOW_RECORD_TYPE_CHANGE=spelling)
+
+    assert cfc.ALLOW_RECORD_TYPE_CHANGE is False, (
+        "%r must not permit retyping a record" % (spelling,)
+    )
+
+
+@pytest.mark.parametrize("spelling", ["true", "TRUE", " True "])
+def test_true_permits_a_record_type_change(load_cfc, spelling):
+    assert load_cfc(ALLOW_RECORD_TYPE_CHANGE=spelling).ALLOW_RECORD_TYPE_CHANGE is True
+
+
+def test_refusal_is_logged_when_content_already_matches(cfc, monkeypatch, caplog):
+    """Same target, different type: nothing is written, and the log says why."""
+    cf = FakeCloudflare([FakeRecord("rec-1", "76.97.80.164", "CNAME")])
+    monkeypatch.setattr(cfc, "cf", cf)
+    monkeypatch.setattr(cfc, "DRY_RUN", False)
+    monkeypatch.setattr(cfc, "REFRESH_ENTRIES", False)
+    monkeypatch.setattr(cfc, "RC_TYPE", "A")
+    monkeypatch.setattr(cfc, "ALLOW_RECORD_TYPE_CHANGE", False)
+
+    with caplog.at_level("WARNING"):
+        cfc.point_domain("app.example.com", [domain_info("76.97.80.164")])
+
+    assert cf.dns.records.updated == []
+    assert "Refusing to change" in caplog.text
+
+
+def test_opted_in_type_change_is_applied_when_content_already_matches(cfc, monkeypatch):
+    """The opt-in means the type changes, even if the target already matches."""
+    cf = FakeCloudflare([FakeRecord("rec-1", "76.97.80.164", "CNAME")])
+    monkeypatch.setattr(cfc, "cf", cf)
+    monkeypatch.setattr(cfc, "DRY_RUN", False)
+    monkeypatch.setattr(cfc, "REFRESH_ENTRIES", False)
+    monkeypatch.setattr(cfc, "RC_TYPE", "A")
+    monkeypatch.setattr(cfc, "ALLOW_RECORD_TYPE_CHANGE", True)
+
+    cfc.point_domain("app.example.com", [domain_info("76.97.80.164")])
+
+    assert len(cf.dns.records.updated) == 1
+    assert cf.dns.records.updated[0][2]["type"] == "A"
